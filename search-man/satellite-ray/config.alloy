@@ -1,0 +1,255 @@
+//////////////////////////////////////////////////////////////////////
+// DigiPolice-SOC v2
+// Enterprise Alloy Configuration
+//
+// Purpose:
+//   Collect Zeek, Wazuh, System Auth, Heartless, BERSERK-IR, 
+//   and SearchMan logs -> Loki
+//
+// Architecture:
+//   Logs ──► Alloy ──► Loki ──► Grafana
+//
+// Author:
+//   Brandon Gregg
+//////////////////////////////////////////////////////////////////////
+
+//////////////////////////////////////////////////////////////////////
+// Loki Output Endpoint
+//////////////////////////////////////////////////////////////////////
+
+loki.write "local_loki" {
+  endpoint {
+    url = "http://127.0.0.1:3100/loki/api/v1/push"
+  }
+}
+
+//////////////////////////////////////////////////////////////////////
+// 1. Zeek Pipeline (Global System Instance)
+//////////////////////////////////////////////////////////////////////
+
+local.file_match "zeek_logs" {
+  path_targets = [{
+    __path__ = "/opt/zeek/logs/current/*.log",
+    job      = "zeek",
+  }]
+}
+
+loki.source.file "zeek_tail" {
+  targets    = local.file_match.zeek_logs.targets
+  forward_to = [loki.write.local_loki.receiver]
+}
+
+//////////////////////////////////////////////////////////////////////
+// 2. System Auth Logs Pipeline (SSH & Authentication)
+//////////////////////////////////////////////////////////////////////
+
+local.file_match "auth_logs" {
+  path_targets = [{
+    __path__     = "/var/log/auth.log",
+    job          = "system_auth",
+    service_name = "sshd",
+  }]
+}
+
+loki.source.file "auth_tail" {
+  targets    = local.file_match.auth_logs.targets
+  forward_to = [loki.write.local_loki.receiver]
+}
+
+//////////////////////////////////////////////////////////////////////
+// 3. Wazuh Pipeline (Structured JSON Alerts)
+//////////////////////////////////////////////////////////////////////
+
+local.file_match "wazuh_logs" {
+  path_targets = [{
+    __path__ = "/var/ossec/logs/alerts/alerts.json",
+    job      = "wazuh",
+  }]
+}
+
+loki.source.file "wazuh_tail" {
+  targets    = local.file_match.wazuh_logs.targets
+  forward_to = [loki.process.wazuh_pipeline.receiver]
+}
+
+loki.process "wazuh_pipeline" {
+
+  stage.json {
+    expressions = {
+      timestamp        = "timestamp",
+      agent_id         = "agent.id",
+      agent_name       = "agent.name",
+      manager          = "manager.name",
+      rule_id          = "rule.id",
+      rule_level       = "rule.level",
+      rule_description = "rule.description",
+      decoder          = "decoder.name",
+      location         = "location",
+      srcuser          = "data.srcuser",
+      dstuser          = "data.dstuser",
+      command          = "data.command",
+      full_log         = "full_log",
+    }
+  }
+
+  stage.labels {
+    values = {
+      job        = "wazuh",
+      agent_name = "",
+      rule_id    = "",
+      rule_level = "",
+      decoder    = "",
+    }
+  }
+
+  forward_to = [
+    loki.write.local_loki.receiver,
+  ]
+}
+
+//////////////////////////////////////////////////////////////////////
+// 4. Operation Heartless Pipeline
+//////////////////////////////////////////////////////////////////////
+
+local.file_match "heartless_logs" {
+  path_targets = [{
+    __path__ = "/home/brandongregg/Portfolios/operation-heartless/logs/sample_auth.log",
+    job      = "operation-heartless",
+    realm    = "realm-of-light",
+  }]
+}
+
+loki.source.file "heartless_tail" {
+  targets       = local.file_match.heartless_logs.targets
+  forward_to    = [loki.process.heartless_parser.receiver]
+  tail_from_end = false
+}
+
+loki.process "heartless_parser" {
+
+  // Parse syslog-style authentication events.
+  stage.regex {
+    expression = "^(?P<timestamp>\\S+\\s+\\d+\\s+\\d{2}:\\d{2}:\\d{2})\\s+(?P<target_node>\\S+)\\s+(?P<process>[^:]+):.*"
+  }
+
+  // Promote important fields to Loki labels.
+  stage.labels {
+    values = {
+      target_node = "",
+      process     = "",
+    }
+  }
+
+  forward_to = [
+    loki.write.local_loki.receiver,
+  ]
+}
+
+//////////////////////////////////////////////////////////////////////
+// 5. BERSERK-IR Incident Telemetry Pipeline
+//////////////////////////////////////////////////////////////////////
+
+local.file_match "berserk_ir_logs" {
+  path_targets = [{
+    __path__       = "/home/brandongregg/Desktop/BERSERK-IR/reports/incident_reports/BERSERK-001-loki.jsonl",
+    job            = "berserk_ir",
+    service_name   = "incident_response",
+  }]
+}
+
+loki.source.file "berserk_ir_tail" {
+  targets       = local.file_match.berserk_ir_logs.targets
+  forward_to    = [loki.process.berserk_ir_parser.receiver]
+  tail_from_end = false
+}
+
+loki.process "berserk_ir_parser" {
+
+  // Parse each BERSERK-IR JSONL telemetry event.
+  stage.json {
+    expressions = {
+      case_id   = "case_id",
+      event     = "event",
+      severity  = "severity",
+      threat    = "threat",
+      indicator = "indicator",
+      decision  = "decision",
+      technique = "technique",
+      status    = "status",
+    }
+  }
+
+  // Promote stable fields to Loki labels.
+  stage.labels {
+    values = {
+      case_id   = "",
+      event     = "",
+      severity  = "",
+      decision  = "",
+      technique = "",
+      status    = "",
+    }
+  }
+
+  forward_to = [
+    loki.write.local_loki.receiver,
+  ]
+}
+
+//////////////////////////////////////////////////////////////////////
+// 6. SearchMan Suite Pipeline (MegaMan Red Sun Lab Suite)
+//////////////////////////////////////////////////////////////////////
+
+// 6A. Scope Gun (Target Recon & Discovery Script)
+local.file_match "searchman_scope_gun_logs" {
+  path_targets = [{
+    __path__     = "/var/log/search_soul_recon.log",
+    job          = "search_man",
+    ability      = "scope_gun",
+    nist_control = "identify",
+  }]
+}
+
+loki.source.file "searchman_scope_gun_tail" {
+  targets    = local.file_match.searchman_scope_gun_logs.targets
+  forward_to = [loki.process.searchman_json_parser.receiver]
+}
+
+loki.process "searchman_json_parser" {
+  stage.json {
+    expressions = {
+      module        = "module",
+      event_type    = "event_type",
+      target_ip     = "target_ip",
+      status        = "status",
+      scanner_host  = "scanner_host",
+    }
+  }
+
+  stage.labels {
+    values = {
+      module     = "",
+      event_type = "",
+      status     = "",
+    }
+  }
+
+  forward_to = [
+    loki.write.local_loki.receiver,
+  ]
+}
+
+// 6B. Target_Acquisition (Zeek Network Session Logs)
+local.file_match "searchman_target_acquisition_logs" {
+  path_targets = [{
+    __path__     = "/opt/zeek/logs/current/*.log",
+    job          = "search_man",
+    ability      = "target_acquisition",
+    nist_control = "detect",
+  }]
+}
+
+loki.source.file "searchman_target_acquisition_tail" {
+  targets    = local.file_match.searchman_target_acquisition_logs.targets
+  forward_to = [loki.write.local_loki.receiver]
+}
